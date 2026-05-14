@@ -1,35 +1,35 @@
 """
 main.py — Pipeline entry point.
- 
-Run the full pipeline:    python main.py
-Run discovery only:       python main.py --step discovery
-Run download only:        python main.py --step download
-Run both:                 python main.py --step all
+
+Steps:
+  discovery  → find repos on GitHub
+  download   → bare clone + extract + delete (integrated)
+  extract    → run extractor standalone on existing bare repos
+  all        → discovery + download (which includes extraction)
 """
- 
+
 import sys
 import argparse
 from pathlib import Path
- 
+
 from src.config_loader import load_config
 from src.utils.logger import setup_logger, get_logger
- 
- 
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Bug Fix Recommender Pipeline")
     parser.add_argument(
         "--step",
-        choices=["discovery", "download", "extract", "preprocess", "all"],
+        choices=["discovery", "download", "all"],
         default="all",
-        help="Which pipeline step to run (default: all)",
+        help="Pipeline step to run (default: all)",
     )
     return parser.parse_args()
- 
- 
+
+
 def main() -> None:
     args = parse_args()
- 
-    # ── 1. Load and validate config ──────────────────────────
+
     try:
         cfg = load_config("config/config.yaml")
     except FileNotFoundError as e:
@@ -38,8 +38,7 @@ def main() -> None:
     except Exception as e:
         print(f"[FATAL] Config validation failed:\n{e}")
         sys.exit(1)
- 
-    # ── 2. Set up logging ────────────────────────────────────
+
     setup_logger(
         log_dir=cfg.logging.log_dir,
         log_file=cfg.logging.log_file,
@@ -49,8 +48,7 @@ def main() -> None:
     )
     logger = get_logger(__name__)
     logger.info("Bug Fix Recommender pipeline starting")
- 
-    # ── 3. Ensure directories exist ──────────────────────────
+
     for d in [
         cfg.downloader.clone_dir,
         cfg.storage.extracted_dir,
@@ -60,55 +58,72 @@ def main() -> None:
     ]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
-    # ── 4. Token check ───────────────────────────────────────
     if cfg.github.token is None:
-        logger.warning(
-            "GitHub token not set. "
-            "Run in PowerShell: os.getenv('GITHUB_TOKEN')"
-        )
+        logger.warning("GitHub token not set. Run: $env:GITHUB_TOKEN='ghp_xxxx'")
     else:
         logger.info("GitHub token loaded from environment.")
 
-    # ── 5. Run requested step ────────────────────────────────
     step = args.step
- 
-    # ── 6. Discovery ─────────────────────────────────────────
+
+    # ── Discovery ─────────────────────────────────────────────
     if step in ("discovery", "all"):
         logger.info("=== STEP: Repository Discovery ===")
         from src.discovery.repo_discovery import RepoDiscovery
-        discoverer = RepoDiscovery(cfg)
-        repos = discoverer.run()
-        logger.info(f"Discovery complete. {len(repos)} repos ready for download.")
- 
-    # ── 7. Download ──────────────────────────────────────────
+        repos = RepoDiscovery(cfg).run()
+        logger.info(f"Discovery complete. {len(repos)} repos ready.")
+
+    # ── Download + Extract (integrated) ──────────────────────
     if step in ("download", "all"):
-        logger.info("=== STEP: Repository Download ===")
+        logger.info("=== STEP: Download + Extract ===")
+
+        from src.extractor.commit_extractor import CommitExtractor
+        from src.storage.dataset_writer import DatasetWriter
         from src.downloader.repo_downloader import RepoDownloader
- 
-        # Extractor callback wired in Step 4.
-        # For now: download and immediately delete (no extraction yet).
-        downloader = RepoDownloader(
-            cfg=cfg,
-            extractor_callback=None,        # Step 4 will inject this
-            max_repo_size_mb=cfg.downloader.max_repo_size_mb,
-        )
-        results = downloader.run()
- 
+
+        extractor = CommitExtractor(cfg)
+
+        # The writer is shared across all repos in this run.
+        # It stays open while the downloader processes each repo.
+        with DatasetWriter(cfg) as writer:
+
+            def extract_and_write(repo_path: Path, repo_meta: dict) -> None:
+                """
+                Extractor callback — called by downloader after each clone.
+                Streams pairs directly to storage. Zero intermediate buffering.
+                """
+                pairs_from_repo = 0
+                for pair in extractor.extract(repo_path, repo_meta):
+                    writer.write(pair)
+                    pairs_from_repo += 1
+
+                logger.info(
+                    f"Extracted {pairs_from_repo} pairs from "
+                    f"{repo_meta.get('full_name', '?')}"
+                )
+
+            downloader = RepoDownloader(
+                cfg=cfg,
+                extractor_callback=extract_and_write,
+                max_repo_size_mb=cfg.downloader.max_repo_size_mb,
+            )
+            results = downloader.run()
+
         processed = sum(1 for r in results.values() if r.get("status") == "processed")
         skipped   = sum(1 for r in results.values() if r.get("status") == "skipped")
+
+        # Print dataset stats after run
+        stats = DatasetWriter(cfg).get_stats()
         logger.info(
-            f"Download step complete. "
+            f"Download+Extract complete. "
             f"Processed: {processed} | Skipped: {skipped}"
         )
- 
-    if step in ("extract", "all"):
-        logger.info("=== STEP: Commit Extraction === (wired in Step 4)")
- 
-    if step in ("preprocess", "all"):
-        logger.info("=== STEP: Preprocessing === (wired in Step 5)")
- 
+        logger.info(
+            f"Dataset: {stats['total_records']} total pairs "
+            f"in {stats['chunk_files']} chunk files → {stats['output_dir']}"
+        )
+
     logger.info("Pipeline run complete.")
- 
- 
+
+
 if __name__ == "__main__":
     main()

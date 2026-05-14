@@ -44,7 +44,7 @@ downloader:
   batch_size: 20
 
   # Seconds git clone will wait before failing.
-  clone_timeout_seconds: 120
+  clone_timeout_seconds: 300
 
   # Delete repo after extraction to save disk space.
   # Set false only if you need to debug extraction manually.

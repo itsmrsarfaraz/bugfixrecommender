@@ -1,66 +1,62 @@
 """
-repo_downloader.py — Clone repos one at a time, safely.
+repo_downloader.py — Clone repos safely as bare repositories.
 
-Design decisions:
-- Shallow clone (depth=1): saves 80-90% disk vs full clone.
-  We only need the commit history from the extractor, and
-  gitpython can still walk commits on a shallow clone.
-- Clone → extract → delete: never hold more than one repo
-  on disk at once. Non-negotiable on a 40GB SSD.
-- Pre-clone size check: GitHub reports repo size in KB via API.
-  We skip repos above our threshold before touching disk.
-- Documentation repo detection: tutorial/learning repos have
-  zero real bug-fix commits. Filtering them saves hours.
+V2 design changes from V1:
+- Bare clone (--bare): only downloads git objects, no working tree.
+  This means NO files are written to disk → filename-too-long
+  impossible on Windows. spring-boot, elasticsearch, dubbo all work.
+- depth=500: captures last 500 commits for bug-fix extraction.
+  depth=1 was wrong — it gave us exactly one commit to walk.
+- Bare repos are smaller than full checkouts by 30-60%.
+- gitpython reads commits and diffs from bare repos identically
+  to normal repos — no API changes needed in the extractor.
 """
 
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
-import git
-from git import Repo, GitCommandError
+from git import Repo, GitCommandError, InvalidGitRepositoryError
 
 from src.config_loader import Config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Repos whose names/descriptions suggest they are documentation,
-# tutorial, awesome-lists, or interview-prep — not real application code.
-# These patterns are matched against repo full_name (case-insensitive).
+# Documentation/tutorial repos — zero real bug-fix commits.
+# Matched against full_name and description (case-insensitive).
 _DOCS_REPO_PATTERNS = [
     "awesome-",
     "interview",
     "tutorial",
     "learning",
-    "guide",
+    "-guide",
+    "JavaGuide",
     "book",
     "leetcode",
-    "algorithm",          # pure algorithm collections, not applications
-    "system-design",
     "-pdf",
     "tech-interview",
     "low-level-design",
-    "source-code-hunter", # reading list repo
+    "source-code-hunter",
+    "system-design-resources",
 ]
+
+# How many commits to fetch per repo.
+# 500 is enough to find dozens of bug-fix commits in active repos.
+# Increase to 1000 later if dataset is too small.
+CLONE_DEPTH = 500
 
 
 class RepoDownloader:
     """
-    Downloads repositories one at a time from the discovery checkpoint.
+    Downloads repositories as bare git clones and passes them
+    to the extractor callback before deleting.
 
-    The extractor_callback is called immediately after each successful
-    clone, before the repo is deleted from disk. This keeps only one
-    repo on disk at any moment.
-
-    Args:
-        cfg:               Validated pipeline config.
-        extractor_callback: Optional function called with (repo_path, repo_meta).
-                           Pass None to clone without extracting (debug mode).
-        max_repo_size_mb:  Skip repos larger than this (default: 500MB).
-                           JetBrains/intellij-community is ~2GB — we skip it.
+    Bare clone = git objects only, no checked-out files.
+    This solves Windows filename length limits permanently.
     """
 
     def __init__(
@@ -85,32 +81,25 @@ class RepoDownloader:
             / cfg.checkpoints.discovered_repos_file
         )
 
-        # Load which repos are already processed (clone+extract done)
         self.processed: Dict[str, dict] = self._load_checkpoint()
 
     # ── Public API ────────────────────────────────────────────
 
     def run(self) -> Dict[str, dict]:
-        """
-        Process all repos from the discovery checkpoint.
-
-        Returns:
-            Dict of successfully processed repo metadata.
-        """
         repos = self._load_discovered_repos()
         if not repos:
             logger.error(
                 "No discovered repos found. "
-                "Run discovery step first: python main.py --step discovery"
+                "Run: python main.py --step discovery"
             )
             return {}
 
         total = len(repos)
         batch_size = self.cfg.downloader.batch_size
         logger.info(
-            f"Downloader starting. {total} repos discovered. "
+            f"Downloader starting. {total} discovered. "
             f"{len(self.processed)} already processed. "
-            f"Batch size: {batch_size}."
+            f"Batch: {batch_size} | Clone depth: {CLONE_DEPTH}"
         )
 
         processed_this_run = 0
@@ -120,73 +109,49 @@ class RepoDownloader:
         for repo_meta in repos:
             full_name = repo_meta["full_name"]
 
-            # Skip if already processed in a previous run
             if full_name in self.processed:
                 logger.debug(f"Already processed: {full_name}")
                 continue
 
-            # Stop when batch limit reached for this run
             if processed_this_run >= batch_size:
-                logger.info(
-                    f"Batch limit of {batch_size} reached. "
-                    f"Re-run to process next batch."
-                )
+                logger.info(f"Batch limit of {batch_size} reached. Re-run for next batch.")
                 break
 
-            logger.info(
-                f"[{processed_this_run + 1}/{batch_size}] Processing: {full_name}"
-            )
+            logger.info(f"[{processed_this_run + 1}/{batch_size}] Processing: {full_name}")
 
-            # Pre-clone validation
             skip_reason = self._pre_clone_check(repo_meta)
             if skip_reason:
                 logger.warning(f"Skipping {full_name}: {skip_reason}")
-                skipped += 1
-                # Mark as skipped so we don't retry it next run
                 self._mark_skipped(repo_meta, skip_reason)
+                skipped += 1
                 continue
 
-            # Clone → extract → delete cycle
             success = self._process_one_repo(repo_meta)
-
             if success:
                 processed_this_run += 1
             else:
                 failed += 1
 
         logger.info(
-            f"Downloader run complete. "
-            f"Processed: {processed_this_run} | "
-            f"Skipped: {skipped} | "
-            f"Failed: {failed}"
+            f"Run complete. Processed: {processed_this_run} | "
+            f"Skipped: {skipped} | Failed: {failed}"
         )
         return self.processed
 
-    # ── Core pipeline: one repo ───────────────────────────────
+    # ── Core cycle: one repo ──────────────────────────────────
 
     def _process_one_repo(self, repo_meta: dict) -> bool:
-        """
-        Clone → callback → delete cycle for a single repo.
-
-        Returns True on success, False on any failure.
-        Cleans up partial clone on any error.
-        """
         full_name = repo_meta["full_name"]
-        # Use only the repo name (not owner) as the local directory name
-        # to avoid path depth issues on Windows.
-        repo_dir_name = full_name.replace("/", "__")
+        repo_dir_name = full_name.replace("/", "__") + ".git"  # .git suffix = bare convention
         repo_path = self.clone_dir / repo_dir_name
 
-        # Clean up any leftover partial clone from a previous failed run
+        # Remove any leftover partial clone from a previous failed run.
+        # Force-remove on Windows using rmtree with retry.
         if repo_path.exists():
-            logger.warning(
-                f"Leftover directory found: {repo_path}. "
-                f"Removing before fresh clone."
-            )
-            shutil.rmtree(repo_path, ignore_errors=True)
+            logger.warning(f"Leftover bare repo found: {repo_path}. Removing.")
+            self._force_remove(repo_path)
 
-        # ── Clone ─────────────────────────────────────────────
-        cloned = self._shallow_clone(
+        cloned = self._bare_clone(
             clone_url=repo_meta["clone_url"],
             target_path=repo_path,
             full_name=full_name,
@@ -195,144 +160,178 @@ class RepoDownloader:
         if not cloned:
             return False
 
-        # ── Extract ───────────────────────────────────────────
+        # Verify the bare repo is readable before invoking extractor
+        if not self._is_valid_bare_repo(repo_path):
+            logger.error(f"Bare repo invalid after clone: {full_name}")
+            self._force_remove(repo_path)
+            return False
+
         try:
             if self.extractor_callback is not None:
                 logger.info(f"Running extractor on: {full_name}")
                 self.extractor_callback(repo_path, repo_meta)
-            else:
-                logger.debug(f"No extractor callback. Skipping extraction for: {full_name}")
         except Exception as e:
             logger.error(f"Extractor failed on {full_name}: {e}")
-            # Extraction failure does NOT count as a downloader failure.
-            # We still delete the repo and checkpoint it so we don't re-clone.
+            # Don't fail the downloader — still checkpoint and delete
 
-        # ── Delete ────────────────────────────────────────────
         if self.cfg.downloader.cleanup_after_extraction:
-            self._delete_repo(repo_path, full_name)
+            self._force_remove(repo_path)
+            logger.info(f"Deleted bare repo: {full_name}")
 
-        # ── Checkpoint ────────────────────────────────────────
         self.processed[full_name] = {**repo_meta, "status": "processed"}
         self._save_checkpoint()
         logger.info(f"Done: {full_name}")
         return True
 
-    def _shallow_clone(
+    def _bare_clone(
         self, clone_url: str, target_path: Path, full_name: str
     ) -> bool:
         """
-        Perform a shallow git clone (depth=1) with retry.
+        Bare clone with depth=500 using subprocess directly.
 
-        depth=1 means we only download the latest snapshot of each file
-        plus enough history to walk commits — typically 80-90% smaller
-        than a full clone. For a repo like elasticsearch this is the
-        difference between 200MB and 2GB.
+        WHY subprocess instead of gitpython's Repo.clone_from:
+        - gitpython does not expose --bare cleanly with all options.
+        - subprocess gives us exact control over git arguments.
+        - We capture stderr for clean error logging.
 
-        Returns True on success, False after retries exhausted.
+        WHY bare:
+        - No working tree → no files written to disk → no Windows
+          filename length errors. Ever.
+        - Git objects only. Extractor reads diffs from objects directly.
         """
-        timeout = self.cfg.downloader.clone_timeout_seconds
         max_retries = 2
 
         for attempt in range(1, max_retries + 1):
+            # Clean up before each attempt (paranoid but safe)
+            if target_path.exists():
+                self._force_remove(target_path)
+
             try:
                 logger.info(
-                    f"Cloning {full_name} "
-                    f"(attempt {attempt}/{max_retries}, depth=1)..."
+                    f"Bare cloning {full_name} "
+                    f"(attempt {attempt}/{max_retries}, depth={CLONE_DEPTH})..."
                 )
-                Repo.clone_from(
-                    url=clone_url,
-                    to_path=str(target_path),
-                    depth=1,                    # shallow — critical for disk safety
-                    single_branch=True,         # only default branch
-                    no_tags=True,               # skip tag objects
-                    env={"GIT_TERMINAL_PROMPT": "0"},  # never prompt for credentials
-                )
-                logger.info(f"Clone successful: {full_name}")
-                return True
 
-            except GitCommandError as e:
+                result = subprocess.run(
+                    [
+                        "git", "clone",
+                        "--bare",
+                        f"--depth={CLONE_DEPTH}",
+                        "--no-tags",
+                        "-q",                   # quiet — suppress progress to logs
+                        clone_url,
+                        str(target_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.cfg.downloader.clone_timeout_seconds,
+                    # GIT_TERMINAL_PROMPT=0 prevents git from hanging
+                    # waiting for credentials on private repos
+                    env={**self._base_env(), "GIT_TERMINAL_PROMPT": "0"},
+                )
+
+                if result.returncode == 0:
+                    logger.info(f"Bare clone successful: {full_name}")
+                    return True
+                else:
+                    logger.warning(
+                        f"Bare clone attempt {attempt} failed for {full_name}. "
+                        f"stderr: {result.stderr[:300]}"
+                    )
+
+            except subprocess.TimeoutExpired:
                 logger.warning(
-                    f"Clone attempt {attempt} failed for {full_name}: {e}"
+                    f"Clone timed out for {full_name} "
+                    f"(>{self.cfg.downloader.clone_timeout_seconds}s)"
                 )
-                # Clean up partial clone before retry
-                if target_path.exists():
-                    shutil.rmtree(target_path, ignore_errors=True)
-
-                if attempt < max_retries:
-                    wait = 10 * attempt  # 10s, 20s
-                    logger.info(f"Waiting {wait}s before retry...")
-                    time.sleep(wait)
-
             except Exception as e:
                 logger.error(f"Unexpected clone error for {full_name}: {e}")
-                if target_path.exists():
-                    shutil.rmtree(target_path, ignore_errors=True)
                 return False
 
-        logger.error(f"All clone attempts failed for {full_name}. Skipping.")
+            if target_path.exists():
+                self._force_remove(target_path)
+
+            if attempt < max_retries:
+                wait = 15 * attempt
+                logger.info(f"Waiting {wait}s before retry...")
+                time.sleep(wait)
+
+        logger.error(f"All clone attempts failed for {full_name}.")
         return False
 
-    def _delete_repo(self, repo_path: Path, full_name: str) -> None:
-        """Delete cloned repo from disk to reclaim space."""
+    def _is_valid_bare_repo(self, repo_path: Path) -> bool:
+        """
+        Check that the bare repo is readable by gitpython.
+        A partial clone can pass subprocess returncode=0 but
+        still produce a corrupt git object store.
+        """
         try:
-            shutil.rmtree(repo_path, ignore_errors=True)
-            logger.info(f"Deleted: {full_name} (disk reclaimed)")
-        except Exception as e:
-            logger.warning(f"Could not delete {repo_path}: {e}")
+            repo = Repo(str(repo_path))
+            # Try to access the HEAD commit — if this works, repo is valid
+            _ = repo.head.commit
+            return True
+        except Exception:
+            return False
 
-    # ── Pre-clone validation ──────────────────────────────────
+    # ── Pre-clone filtering ───────────────────────────────────
 
     def _pre_clone_check(self, repo_meta: dict) -> Optional[str]:
-        """
-        Return a rejection reason if the repo should be skipped,
-        or None if it's safe to clone.
+        """Return rejection reason or None if safe to clone."""
 
-        Checks (in order):
-        1. Free disk space
-        2. Repo size (from GitHub metadata, in KB)
-        3. Documentation/tutorial repo detection
-        """
-        # 1. Disk space check
+        # 1. Disk space
         free_gb = self._free_disk_gb()
         min_gb = self.cfg.downloader.min_free_disk_gb
         if free_gb < min_gb:
-            return (
-                f"insufficient disk space "
-                f"({free_gb:.1f}GB free, need {min_gb}GB)"
-            )
+            return f"insufficient disk ({free_gb:.1f}GB free, need {min_gb}GB)"
 
-        # 2. Repo size check
-        # GitHub reports size in KB. We cap at max_repo_size_mb.
-        # Note: GitHub's size field is approximate and excludes
-        # some binary assets, but it's good enough for our filter.
-        repo_size_kb = repo_meta.get("size_kb")
-        if repo_size_kb is not None:
-            size_mb = repo_size_kb / 1024
+        # 2. Repo size (GitHub reports in KB)
+        size_kb = repo_meta.get("size_kb")
+        if size_kb is not None:
+            size_mb = size_kb / 1024
             if size_mb > self.max_repo_size_mb:
-                return (
-                    f"repo too large "
-                    f"({size_mb:.0f}MB > {self.max_repo_size_mb}MB limit)"
-                )
+                return f"too large ({size_mb:.0f}MB > {self.max_repo_size_mb}MB)"
 
-        # 3. Documentation/tutorial repo detection
+        # 3. Docs/tutorial repo detection
         full_name_lower = repo_meta["full_name"].lower()
-        description_lower = (repo_meta.get("description") or "").lower()
-
+        desc_lower = (repo_meta.get("description") or "").lower()
         for pattern in _DOCS_REPO_PATTERNS:
-            if pattern in full_name_lower or pattern in description_lower:
-                return f"likely documentation/tutorial repo (matched: '{pattern}')"
+            p = pattern.lower()
+            if p in full_name_lower or p in desc_lower:
+                return f"docs/tutorial repo (matched: '{pattern}')"
 
-        return None  # passes all checks
+        return None
 
     def _free_disk_gb(self) -> float:
-        """Return free disk space in GB at the clone directory."""
-        usage = shutil.disk_usage(self.clone_dir)
-        return usage.free / (1024 ** 3)
+        return shutil.disk_usage(self.clone_dir).free / (1024 ** 3)
+
+    # ── Robust deletion ───────────────────────────────────────
+
+    def _force_remove(self, path: Path) -> None:
+        """
+        Delete a directory tree robustly on Windows.
+
+        Windows problem: git pack files and index files are marked
+        read-only by git. shutil.rmtree fails on read-only files.
+        Solution: use onerror handler to chmod before retry.
+        """
+        import stat
+
+        def handle_readonly(func, fpath, exc_info):
+            """Make file writable then retry deletion."""
+            try:
+                Path(fpath).chmod(stat.S_IWRITE)
+                func(fpath)
+            except Exception:
+                pass  # Best effort — log but don't crash
+
+        try:
+            shutil.rmtree(path, onerror=handle_readonly)
+        except Exception as e:
+            logger.warning(f"Could not fully remove {path}: {e}")
 
     # ── Checkpoint helpers ────────────────────────────────────
 
     def _load_discovered_repos(self) -> List[dict]:
-        """Load the list of repos from the discovery checkpoint."""
         if not self.discovery_checkpoint.exists():
             return []
         try:
@@ -343,21 +342,19 @@ class RepoDownloader:
             return []
 
     def _load_checkpoint(self) -> Dict[str, dict]:
-        """Load already-processed repos from checkpoint."""
         if not self.checkpoint_path.exists():
             return {}
         try:
             with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             result = {r["full_name"]: r for r in data}
-            logger.info(f"Downloader checkpoint: {len(result)} repos already processed.")
+            logger.info(f"Downloader checkpoint: {len(result)} already processed.")
             return result
         except Exception as e:
             logger.warning(f"Could not load downloader checkpoint: {e}. Starting fresh.")
             return {}
 
     def _save_checkpoint(self) -> None:
-        """Atomic checkpoint write."""
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.checkpoint_path.with_suffix(".tmp")
         try:
@@ -365,15 +362,11 @@ class RepoDownloader:
                 json.dump(list(self.processed.values()), f, indent=2, default=str)
             tmp.replace(self.checkpoint_path)
         except Exception as e:
-            logger.error(f"Failed to save downloader checkpoint: {e}")
+            logger.error(f"Failed to save checkpoint: {e}")
             if tmp.exists():
                 tmp.unlink()
 
     def _mark_skipped(self, repo_meta: dict, reason: str) -> None:
-        """
-        Mark a repo as skipped in the checkpoint so we don't
-        attempt it again on future runs.
-        """
         full_name = repo_meta["full_name"]
         self.processed[full_name] = {
             **repo_meta,
@@ -381,3 +374,9 @@ class RepoDownloader:
             "skip_reason": reason,
         }
         self._save_checkpoint()
+
+    @staticmethod
+    def _base_env() -> dict:
+        """Return OS environment variables needed for subprocess git calls."""
+        import os
+        return dict(os.environ)

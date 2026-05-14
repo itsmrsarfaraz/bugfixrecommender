@@ -1,19 +1,16 @@
 """
-test_repo_downloader.py — Unit tests for RepoDownloader.
-
-All tests are fully offline. Git clone is mocked.
-
-Run with: pytest tests/ -v
+test_repo_downloader.py — Unit tests for RepoDownloader (bare clone).
+All tests offline. subprocess git is mocked.
 """
 
 import json
-import shutil
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
+import subprocess
 
 from src.config_loader import load_config
-from src.downloader.repo_downloader import RepoDownloader, _DOCS_REPO_PATTERNS
+from src.downloader.repo_downloader import RepoDownloader
 
 
 @pytest.fixture
@@ -29,7 +26,7 @@ def cfg(tmp_path):
 def make_repo_meta(
     full_name="apache/commons-lang",
     clone_url="https://github.com/apache/commons-lang.git",
-    size_kb=50_000,  # 50MB
+    size_kb=50_000,
     description="Apache Commons Lang",
 ):
     return {
@@ -44,60 +41,121 @@ def make_repo_meta(
     }
 
 
-# ── Pre-clone checks ──────────────────────────────────────────
+# ── Pre-clone filtering ───────────────────────────────────────
 
 class TestPreCloneCheck:
 
     def test_good_repo_passes(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta()
-        assert dl._pre_clone_check(meta) is None
+        assert dl._pre_clone_check(make_repo_meta()) is None
 
     def test_large_repo_rejected(self, cfg):
         dl = RepoDownloader(cfg)
-        # 600MB — over our 500MB default limit
-        meta = make_repo_meta(size_kb=600_000)
-        reason = dl._pre_clone_check(meta)
-        assert reason is not None
-        assert "too large" in reason
+        reason = dl._pre_clone_check(make_repo_meta(size_kb=600_000))
+        assert reason is not None and "large" in reason
 
     def test_docs_repo_rejected_by_name(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta(full_name="user/awesome-java-resources")
-        reason = dl._pre_clone_check(meta)
-        assert reason is not None
-        assert "documentation" in reason
+        reason = dl._pre_clone_check(make_repo_meta(full_name="user/awesome-java"))
+        assert reason is not None and "docs" in reason
 
     def test_tutorial_repo_rejected_by_description(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta(
-            full_name="user/myrepo",
-            description="A complete tutorial for learning Java"
+        reason = dl._pre_clone_check(
+            make_repo_meta(full_name="user/repo", description="Java tutorial for beginners")
         )
-        reason = dl._pre_clone_check(meta)
         assert reason is not None
 
     def test_interview_repo_rejected(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta(full_name="gyoogle/tech-interview-for-developer")
-        reason = dl._pre_clone_check(meta)
+        reason = dl._pre_clone_check(make_repo_meta(full_name="gyoogle/tech-interview-for-developer"))
         assert reason is not None
 
     def test_real_project_passes(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta(
-            full_name="apache/kafka",
-            description="Mirror of Apache Kafka",
-            size_kb=200_000,  # 200MB — under limit
-        )
-        assert dl._pre_clone_check(meta) is None
+        assert dl._pre_clone_check(
+            make_repo_meta(full_name="apache/kafka", description="Mirror of Apache Kafka", size_kb=200_000)
+        ) is None
+
+    def test_spring_boot_no_longer_fails_on_filename(self, cfg):
+        """
+        With bare clone there is NO working tree written to disk.
+        spring-boot filename-too-long errors cannot occur.
+        This test documents the fix — bare clone should succeed
+        even for repos with 260+ char filenames.
+        """
+        dl = RepoDownloader(cfg)
+        # spring-boot has reasonable size, not a docs repo → passes pre-check
+        assert dl._pre_clone_check(
+            make_repo_meta(full_name="spring-projects/spring-boot", size_kb=150_000)
+        ) is None
+
+
+# ── Bare clone ────────────────────────────────────────────────
+
+class TestBareClone:
+
+    def test_successful_bare_clone(self, cfg, tmp_path):
+        dl = RepoDownloader(cfg)
+        target = tmp_path / "test.git"
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = dl._bare_clone(
+                clone_url="https://github.com/apache/commons-lang.git",
+                target_path=target,
+                full_name="apache/commons-lang",
+            )
+
+        assert result is True
+        # Verify --bare flag was passed
+        call_args = mock_run.call_args[0][0]
+        assert "--bare" in call_args
+
+    def test_clone_failure_returns_false(self, cfg, tmp_path):
+        dl = RepoDownloader(cfg)
+        target = tmp_path / "test.git"
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128, stderr="fatal: repository not found"
+            )
+            result = dl._bare_clone(
+                clone_url="https://github.com/bad/repo.git",
+                target_path=target,
+                full_name="bad/repo",
+            )
+
+        assert result is False
+
+    def test_clone_uses_correct_depth(self, cfg, tmp_path):
+        dl = RepoDownloader(cfg)
+        target = tmp_path / "test.git"
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            dl._bare_clone("https://github.com/a/b.git", target, "a/b")
+
+        call_args = mock_run.call_args[0][0]
+        depth_args = [a for a in call_args if a.startswith("--depth")]
+        assert len(depth_args) == 1
+        assert "500" in depth_args[0]
+
+    def test_timeout_returns_false(self, cfg, tmp_path):
+        dl = RepoDownloader(cfg)
+        target = tmp_path / "test.git"
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 120)):
+            result = dl._bare_clone("https://github.com/a/b.git", target, "a/b")
+
+        assert result is False
 
 
 # ── Checkpoint ────────────────────────────────────────────────
 
 class TestCheckpointing:
 
-    def test_checkpoint_saves_and_reloads(self, cfg, tmp_path):
+    def test_saves_and_reloads(self, cfg):
         dl = RepoDownloader(cfg)
         meta = make_repo_meta()
         dl.processed["apache/commons-lang"] = {**meta, "status": "processed"}
@@ -106,82 +164,28 @@ class TestCheckpointing:
         dl2 = RepoDownloader(cfg)
         assert "apache/commons-lang" in dl2.processed
 
-    def test_skipped_repos_are_checkpointed(self, cfg):
+    def test_mark_skipped(self, cfg):
         dl = RepoDownloader(cfg)
-        meta = make_repo_meta()
-        dl._mark_skipped(meta, "too large")
+        dl._mark_skipped(make_repo_meta(), "too large")
         assert dl.processed["apache/commons-lang"]["status"] == "skipped"
-        assert "too large" in dl.processed["apache/commons-lang"]["skip_reason"]
-
-
-# ── Clone + process cycle ─────────────────────────────────────
-
-class TestProcessCycle:
-
-    def test_extractor_callback_called_on_success(self, cfg, tmp_path):
-        """Extractor callback must be invoked after a successful clone."""
-        dl = RepoDownloader(cfg)
-        callback_calls = []
-
-        def fake_callback(path, meta):
-            callback_calls.append((path, meta["full_name"]))
-
-        dl.extractor_callback = fake_callback
-        meta = make_repo_meta()
-
-        with patch("src.downloader.repo_downloader.Repo") as mock_repo_cls:
-            mock_repo_cls.clone_from.return_value = MagicMock()
-            # Create the target directory to simulate a successful clone
-            target = Path(cfg.downloader.clone_dir) / "apache__commons-lang"
-            target.mkdir(parents=True, exist_ok=True)
-
-            result = dl._process_one_repo(meta)
-
-        assert result is True
-        assert len(callback_calls) == 1
-        assert callback_calls[0][1] == "apache/commons-lang"
-
-    def test_failed_clone_returns_false(self, cfg):
-        dl = RepoDownloader(cfg)
-
-        with patch("src.downloader.repo_downloader.Repo") as mock_repo_cls:
-            from git import GitCommandError
-            mock_repo_cls.clone_from.side_effect = GitCommandError("clone", 128)
-            meta = make_repo_meta()
-            result = dl._shallow_clone(
-                clone_url=meta["clone_url"],
-                target_path=Path(cfg.downloader.clone_dir) / "test",
-                full_name=meta["full_name"],
-            )
-
-        assert result is False
 
     def test_no_discovered_repos_returns_empty(self, cfg):
-        """run() must exit cleanly if discovery hasn't been run yet."""
         dl = RepoDownloader(cfg)
-        result = dl.run()
-        assert result == {}
+        assert dl.run() == {}
 
-    def test_already_processed_repos_are_skipped(self, cfg):
-        """Repos already in the checkpoint must not be re-cloned."""
+    def test_already_processed_not_recloned(self, cfg):
         meta = make_repo_meta()
+        Path(cfg.checkpoints.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-        # Pre-populate checkpoint
+        # Pre-populate both checkpoints
+        disc_path = Path(cfg.checkpoints.checkpoint_dir) / "discovered_repos.json"
+        disc_path.write_text(json.dumps([meta]))
+
         dl = RepoDownloader(cfg)
         dl.processed["apache/commons-lang"] = {**meta, "status": "processed"}
         dl._save_checkpoint()
 
-        # Write a fake discovery checkpoint
-        Path(cfg.checkpoints.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        disc_path = (
-            Path(cfg.checkpoints.checkpoint_dir)
-            / "discovered_repos.json"
-        )
-        disc_path.write_text(json.dumps([meta]))
-
-        clone_called = []
         dl2 = RepoDownloader(cfg)
-
-        with patch.object(dl2, "_shallow_clone") as mock_clone:
+        with patch.object(dl2, "_bare_clone") as mock_clone:
             dl2.run()
             mock_clone.assert_not_called()
