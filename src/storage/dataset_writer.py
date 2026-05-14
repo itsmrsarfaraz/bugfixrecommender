@@ -68,6 +68,7 @@ class DatasetWriter:
         if self._current_file is None:
             self._open_current_chunk()
 
+        assert self._current_file is not None
         try:
             line = json.dumps(pair.to_dict(), ensure_ascii=False)
             self._current_file.write(line + "\n")
