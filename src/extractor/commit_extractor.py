@@ -265,12 +265,16 @@ class CommitExtractor:
         Returns None if any file-level filter rejects it.
         """
         # Only process Modified files.
-        # 'A' = Added (new file — not a fix, it's new code)
-        # 'D' = Deleted (removing code — too ambiguous)
-        # 'R' = Renamed (may have content changes but primarily structural)
-        # 'M' = Modified — this is what we want
-        change_type = diff.change_type
-        if change_type != "M":
+        # gitpython's change_type is unreliable with create_patch=True —
+        # it returns None instead of 'M' for modified files in many versions.
+        # Use the explicit boolean flags instead — these ARE reliably populated.
+        # A file is Modified if it is NOT new, NOT deleted, and NOT renamed.
+        is_modified = (
+            not getattr(diff, 'new_file', False) and
+            not getattr(diff, 'deleted_file', False) and
+            not getattr(diff, 'renamed_file', False)
+        )
+        if not is_modified:
             return None
 
         file_path = diff.b_path  # path after the fix
