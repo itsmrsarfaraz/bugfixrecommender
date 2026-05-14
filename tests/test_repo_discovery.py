@@ -66,14 +66,18 @@ class TestFilterReason:
         with patch("src.discovery.repo_discovery.Github"):
             discoverer = RepoDiscovery(cfg)
         repo = make_mock_repo(fork=True)
-        assert "fork" in discoverer._filter_reason(repo)
+        reason = discoverer._filter_reason(repo)
+        assert reason is not None
+        assert "fork" in reason
 
     def test_archived_is_rejected(self, cfg, tmp_path):
         cfg.checkpoints.checkpoint_dir = str(tmp_path)
         with patch("src.discovery.repo_discovery.Github"):
             discoverer = RepoDiscovery(cfg)
         repo = make_mock_repo(archived=True)
-        assert "archived" in discoverer._filter_reason(repo)
+        reason = discoverer._filter_reason(repo)
+        assert reason is not None
+        assert "archived" in reason
 
     def test_inactive_repo_is_rejected(self, cfg, tmp_path):
         cfg.checkpoints.checkpoint_dir = str(tmp_path)

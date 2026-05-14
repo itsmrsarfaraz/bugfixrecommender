@@ -41,7 +41,7 @@ downloader:
 
   # How many repos to clone per pipeline run.
   # Small batches = safe checkpointing on your 40GB SSD.
-  batch_size: 3
+  batch_size: 20
 
   # Seconds git clone will wait before failing.
   clone_timeout_seconds: 120
