@@ -1,18 +1,20 @@
 """
 main.py — Pipeline entry point.
-
+ 
 Run the full pipeline:    python main.py
 Run discovery only:       python main.py --step discovery
+Run download only:        python main.py --step download
+Run both:                 python main.py --step all
 """
-
+ 
 import sys
 import argparse
 from pathlib import Path
-
+ 
 from src.config_loader import load_config
 from src.utils.logger import setup_logger, get_logger
-
-
+ 
+ 
 def parse_args():
     parser = argparse.ArgumentParser(description="Bug Fix Recommender Pipeline")
     parser.add_argument(
@@ -22,11 +24,11 @@ def parse_args():
         help="Which pipeline step to run (default: all)",
     )
     return parser.parse_args()
-
-
+ 
+ 
 def main() -> None:
     args = parse_args()
-
+ 
     # ── 1. Load and validate config ──────────────────────────
     try:
         cfg = load_config("config/config.yaml")
@@ -36,7 +38,7 @@ def main() -> None:
     except Exception as e:
         print(f"[FATAL] Config validation failed:\n{e}")
         sys.exit(1)
-
+ 
     # ── 2. Set up logging ────────────────────────────────────
     setup_logger(
         log_dir=cfg.logging.log_dir,
@@ -47,7 +49,7 @@ def main() -> None:
     )
     logger = get_logger(__name__)
     logger.info("Bug Fix Recommender pipeline starting")
-
+ 
     # ── 3. Ensure directories exist ──────────────────────────
     for d in [
         cfg.downloader.clone_dir,
@@ -69,25 +71,44 @@ def main() -> None:
 
     # ── 5. Run requested step ────────────────────────────────
     step = args.step
-
+ 
+    # ── 6. Discovery ─────────────────────────────────────────
     if step in ("discovery", "all"):
         logger.info("=== STEP: Repository Discovery ===")
         from src.discovery.repo_discovery import RepoDiscovery
         discoverer = RepoDiscovery(cfg)
         repos = discoverer.run()
         logger.info(f"Discovery complete. {len(repos)} repos ready for download.")
-
+ 
+    # ── 7. Download ──────────────────────────────────────────
     if step in ("download", "all"):
-        logger.info("=== STEP: Repository Download === (not yet implemented)")
-
+        logger.info("=== STEP: Repository Download ===")
+        from src.downloader.repo_downloader import RepoDownloader
+ 
+        # Extractor callback wired in Step 4.
+        # For now: download and immediately delete (no extraction yet).
+        downloader = RepoDownloader(
+            cfg=cfg,
+            extractor_callback=None,        # Step 4 will inject this
+            max_repo_size_mb=cfg.downloader.max_repo_size_mb,
+        )
+        results = downloader.run()
+ 
+        processed = sum(1 for r in results.values() if r.get("status") == "processed")
+        skipped   = sum(1 for r in results.values() if r.get("status") == "skipped")
+        logger.info(
+            f"Download step complete. "
+            f"Processed: {processed} | Skipped: {skipped}"
+        )
+ 
     if step in ("extract", "all"):
-        logger.info("=== STEP: Commit Extraction === (not yet implemented)")
-
+        logger.info("=== STEP: Commit Extraction === (wired in Step 4)")
+ 
     if step in ("preprocess", "all"):
-        logger.info("=== STEP: Preprocessing === (not yet implemented)")
-
+        logger.info("=== STEP: Preprocessing === (wired in Step 5)")
+ 
     logger.info("Pipeline run complete.")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()

@@ -8,7 +8,7 @@ github:
   # Personal Access Token loaded from environment variable.
   # Set in your shell: $env:GITHUB_TOKEN="ghp_xxxx"
   # NEVER paste your token here — this file is committed to git.
-  token_env: env("GITHUB_TOKEN")
+  token_env: "GITHUB_TOKEN"
 
   # Only clone repos with at least this many stars.
   # Low-star repos = abandoned code = noisy data.
@@ -41,7 +41,7 @@ downloader:
 
   # How many repos to clone per pipeline run.
   # Small batches = safe checkpointing on your 40GB SSD.
-  batch_size: 20
+  batch_size: 3
 
   # Seconds git clone will wait before failing.
   clone_timeout_seconds: 120
@@ -49,6 +49,10 @@ downloader:
   # Delete repo after extraction to save disk space.
   # Set false only if you need to debug extraction manually.
   cleanup_after_extraction: true
+
+  # Skip repos larger than this (MB). Shallow clone still helps,
+  # but repos like intellij-community (2GB) are impractical.
+  max_repo_size_mb: 500
 
 extractor:
   # Keywords that flag a commit as a bug fix.

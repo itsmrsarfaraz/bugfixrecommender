@@ -48,6 +48,7 @@ class DownloaderConfig(BaseModel):
     batch_size: int = Field(ge=1)
     clone_timeout_seconds: int = Field(ge=10)
     cleanup_after_extraction: bool
+    max_repo_size_mb: int = Field(ge=50)  # minimum 50MB makes no sense below this
 
 
 class ExtractorConfig(BaseModel):
