@@ -1,0 +1,142 @@
+# ============================================================
+# Bug Fix Recommender — Single Source of Truth
+# All thresholds, paths, and flags live here.
+# Never hardcode values in src/ — always read from this file.
+# ============================================================
+
+github:
+  # Personal Access Token loaded from environment variable.
+  # Set in your shell: $env:GITHUB_TOKEN="ghp_xxxx"
+  # NEVER paste your token here — this file is committed to git.
+  token_env: env("GITHUB_TOKEN")
+
+  # Only clone repos with at least this many stars.
+  # Low-star repos = abandoned code = noisy data.
+  min_stars: 100
+
+  # Only consider repos updated within this many days.
+  # Dead repos produce stale, irrelevant bug patterns.
+  min_activity_days: 365
+
+  # Max repos to discover per pipeline run.
+  # Keeps run time predictable on your hardware.
+  max_repos: 200
+
+  # GitHub API search query (v1 = Java only)
+  language: "Java"
+
+  # Repos per API page (max 100 per GitHub docs)
+  per_page: 100
+
+  # Seconds to wait between paginated API calls.
+  # Prevents hitting secondary rate limits.
+  request_delay_seconds: 1
+
+downloader:
+  # Where cloned repos land on disk.
+  clone_dir: "data/raw"
+
+  # Hard stop: refuse to clone if free disk drops below this (GB).
+  min_free_disk_gb: 5.0
+
+  # How many repos to clone per pipeline run.
+  # Small batches = safe checkpointing on your 40GB SSD.
+  batch_size: 20
+
+  # Seconds git clone will wait before failing.
+  clone_timeout_seconds: 120
+
+  # Delete repo after extraction to save disk space.
+  # Set false only if you need to debug extraction manually.
+  cleanup_after_extraction: true
+
+extractor:
+  # Keywords that flag a commit as a bug fix.
+  # Case-insensitive match against full commit message.
+  bug_fix_keywords:
+    - "fix"
+    - "fixed"
+    - "fixes"
+    - "bug"
+    - "issue"
+    - "patch"
+    - "resolve"
+    - "resolved"
+    - "hotfix"
+    - "defect"
+    - "failure"
+    - "error"
+    - "fault"
+    - "repair"
+
+  # File extensions to extract (v1 = Java only).
+  # Architecture supports adding "py", "js", "ts" in v2.
+  target_extensions:
+    - ".java"
+
+  # Noise filters — skip commits where diff stats exceed these.
+  # A commit changing 200+ lines is a refactor, not a bug fix.
+  max_diff_lines: 200
+
+  # Skip commits touching more than this many files.
+  # Broad changes = low-signal for targeted bug fixing.
+  max_files_changed: 5
+
+  # Skip pairs where the code delta is below this token count.
+  # Whitespace/comment-only diffs produce useless training pairs.
+  min_meaningful_tokens: 3
+
+  # Commit message substrings that always indicate noise.
+  # Checked after keyword match — these override the keyword.
+  noise_keywords:
+    - "merge"
+    - "revert"
+    - "bump"
+    - "update dep"
+    - "upgrade dep"
+    - "reformat"
+    - "rename"
+    - "chore"
+    - "style"
+    - "whitespace"
+    - "typo"
+
+storage:
+  # Where extracted bug-fix pairs are written.
+  extracted_dir: "data/extracted"
+
+  # Where final processed dataset lands.
+  processed_dir: "data/processed"
+
+  # Write format: "jsonl" or "parquet"
+  # jsonl = human-readable, easy to debug.
+  # parquet = 5-10x smaller, faster for ML training.
+  # Use jsonl for v1 — switch to parquet when dataset grows.
+  output_format: "jsonl"
+
+  # Max records per output file.
+  # Prevents single gigantic files that kill RAM on load.
+  chunk_size: 1000
+
+checkpoints:
+  # Directory to store pipeline resume state.
+  checkpoint_dir: "checkpoints"
+
+  # Checkpoint file names
+  discovered_repos_file: "discovered_repos.json"
+  cloned_repos_file: "cloned_repos.json"
+  processed_repos_file: "processed_repos.json"
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+
+  # Log file location
+  log_dir: "logs"
+  log_file: "pipeline.log"
+
+  # Rotate log file when it hits this size
+  rotation: "10 MB"
+
+  # Keep this many rotated log files
+  retention: "7 days"
