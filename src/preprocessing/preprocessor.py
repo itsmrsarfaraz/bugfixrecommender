@@ -34,7 +34,7 @@ logger = get_logger(__name__)
 # The extractor uses token_delta (change size).
 # We use absolute token counts to remove trivially small or huge files.
 MIN_TOKENS = 20        # buggy or fixed file with <20 tokens = useless
-MAX_TOKENS = 2000      # files > 2000 tokens exceed BM25's sweet spot
+MAX_TOKENS = 8000      # files > 8000 tokens exceed BM25's sweet spot
 
 # Split ratios — must sum to 1.0
 TRAIN_RATIO = 0.70
