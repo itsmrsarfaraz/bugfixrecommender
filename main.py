@@ -1,11 +1,12 @@
 """
 main.py — Pipeline entry point.
 
+
 Steps:
-  discovery  → find repos on GitHub
-  download   → bare clone + extract + delete (integrated)
-  extract    → run extractor standalone on existing bare repos
-  all        → discovery + download (which includes extraction)
+python main.py --step discovery  → find repos on GitHub
+python main.py --step download   → bare clone + extract + delete (integrated)
+python main.py --step preprocess → deduplicate, filter, split train/val/test
+python main.py --step all        → discovery + download + preprocess
 """
 
 import sys
@@ -20,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Bug Fix Recommender Pipeline")
     parser.add_argument(
         "--step",
-        choices=["discovery", "download", "all"],
+        choices=["discovery", "download", "preprocess", "all"],
         default="all",
         help="Pipeline step to run (default: all)",
     )
@@ -82,20 +83,13 @@ def main() -> None:
 
         extractor = CommitExtractor(cfg)
 
-        # The writer is shared across all repos in this run.
-        # It stays open while the downloader processes each repo.
         with DatasetWriter(cfg) as writer:
 
             def extract_and_write(repo_path: Path, repo_meta: dict) -> None:
-                """
-                Extractor callback — called by downloader after each clone.
-                Streams pairs directly to storage. Zero intermediate buffering.
-                """
                 pairs_from_repo = 0
                 for pair in extractor.extract(repo_path, repo_meta):
                     writer.write(pair)
                     pairs_from_repo += 1
-
                 logger.info(
                     f"Extracted {pairs_from_repo} pairs from "
                     f"{repo_meta.get('full_name', '?')}"
@@ -111,7 +105,6 @@ def main() -> None:
         processed = sum(1 for r in results.values() if r.get("status") == "processed")
         skipped   = sum(1 for r in results.values() if r.get("status") == "skipped")
 
-        # Print dataset stats after run
         stats = DatasetWriter(cfg).get_stats()
         logger.info(
             f"Download+Extract complete. "
@@ -119,7 +112,20 @@ def main() -> None:
         )
         logger.info(
             f"Dataset: {stats['total_records']} total pairs "
-            f"in {stats['chunk_files']} chunk files → {stats['output_dir']}"
+            f"in {stats['chunk_files']} chunk files -> {stats['output_dir']}"
+        )
+
+    # ── Preprocess ────────────────────────────────────────────
+    if step in ("preprocess", "all"):
+        logger.info("=== STEP: Preprocessing ===")
+        from src.preprocessing.preprocessor import Preprocessor
+        stats = Preprocessor(cfg).run()
+        logger.info(
+            f"Clean dataset: "
+            f"train={stats['train_pairs']} | "
+            f"val={stats['val_pairs']} | "
+            f"test={stats['test_pairs']} | "
+            f"dropped={stats['dropped_total']}"
         )
 
     logger.info("Pipeline run complete.")
