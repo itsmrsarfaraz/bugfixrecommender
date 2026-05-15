@@ -9,12 +9,12 @@ import json
 import pytest
 from pathlib import Path
 
-from src.config_loader import load_config
+from src.config_loader import Config, load_config
 from src.preprocessing.preprocessor import Preprocessor, MIN_TOKENS, MAX_TOKENS
 
 
 @pytest.fixture
-def cfg(tmp_path):
+def cfg(tmp_path: Path):
     cfg = load_config("config/config.yaml")
     cfg.storage.extracted_dir = str(tmp_path / "extracted")
     cfg.storage.processed_dir = str(tmp_path / "processed")
@@ -59,7 +59,7 @@ def write_chunk(path: Path, pairs: list) -> None:
 
 class TestDeduplication:
 
-    def test_duplicate_pairs_removed(self, cfg, tmp_path):
+    def test_duplicate_pairs_removed(self, cfg: Config, tmp_path: Path):
         pair = make_pair()
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         # Write same pair twice
@@ -71,7 +71,7 @@ class TestDeduplication:
         assert stats["dropped_duplicate"] == 1
         assert stats["clean_total"] == 1
 
-    def test_different_pairs_both_kept(self, cfg, tmp_path):
+    def test_different_pairs_both_kept(self, cfg: Config, tmp_path: Path):
         p1 = make_pair(buggy="public void a() { " + "x " * 30 + "}")
         p2 = make_pair(buggy="public void b() { " + "y " * 30 + "}")
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
@@ -88,7 +88,7 @@ class TestDeduplication:
 
 class TestQualityFilters:
 
-    def test_identical_buggy_fixed_dropped(self, cfg):
+    def test_identical_buggy_fixed_dropped(self, cfg: Config):
         pair = make_pair(buggy="public void x() {}", fixed="public void x() {}")
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -96,7 +96,7 @@ class TestQualityFilters:
         stats = Preprocessor(cfg).run()
         assert stats["dropped_identical"] == 1
 
-    def test_too_short_dropped(self, cfg):
+    def test_too_short_dropped(self, cfg: Config):
         # Only 3 tokens — below MIN_TOKENS (20)
         pair = make_pair(buggy="int x = 1;", fixed="int x = 2;")
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
@@ -105,9 +105,9 @@ class TestQualityFilters:
         stats = Preprocessor(cfg).run()
         assert stats["dropped_too_short"] == 1
 
-    def test_too_long_dropped(self, cfg):
+    def test_too_long_dropped(self, cfg: Config):
         # 2001 tokens — above MAX_TOKENS (2000)
-        long_code = "x " * 2001
+        long_code = "x " * 8001
         pair = make_pair(buggy=long_code, fixed=long_code + " extra")
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -115,7 +115,7 @@ class TestQualityFilters:
         stats = Preprocessor(cfg).run()
         assert stats["dropped_too_long"] == 1
 
-    def test_zero_diff_dropped(self, cfg):
+    def test_zero_diff_dropped(self, cfg: Config):
         pair = make_pair(added=0, removed=0)
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -123,7 +123,7 @@ class TestQualityFilters:
         stats = Preprocessor(cfg).run()
         assert stats["dropped_bad_diff"] == 1
 
-    def test_valid_pair_passes_all_filters(self, cfg):
+    def test_valid_pair_passes_all_filters(self, cfg: Config):
         pair = make_pair()
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -137,7 +137,7 @@ class TestQualityFilters:
 
 class TestRepoSplitting:
 
-    def test_same_repo_goes_to_same_split(self, cfg):
+    def test_same_repo_goes_to_same_split(self, cfg: Config):
         """All pairs from one repo must land in the same split."""
         pairs = [make_pair(repo="apache/kafka") for _ in range(5)]
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
@@ -160,15 +160,15 @@ class TestRepoSplitting:
         # All 5 pairs from one repo must go to exactly ONE split
         assert splits_with_repo == 1
 
-    def test_multiple_repos_distributed(self, cfg):
+    def test_multiple_repos_distributed(self, cfg: Config):
         """With enough repos, all three splits should be populated."""
         pairs = []
         # Create 20 different repos with valid pairs each
         for i in range(20):
             pairs.append(make_pair(
                 repo=f"org/repo{i:02d}",
-                buggy=f"public void method{i}() {{ " + "x " * 30 + "}",
-                fixed=f"public void method{i}() {{ return null; " + "x " * 30 + "}}",
+                buggy=f"public void method{i}() {{ {'x ' * 30}}}",
+                fixed=f"public void method{i}() {{ return null; {'x ' * 30}}}",
             ))
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, pairs)
@@ -184,7 +184,7 @@ class TestRepoSplitting:
 
 class TestOutputFiles:
 
-    def test_split_files_created(self, cfg):
+    def test_split_files_created(self, cfg: Config):
         pair = make_pair()
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -196,7 +196,7 @@ class TestOutputFiles:
         assert (Path(cfg.storage.processed_dir) / "test.jsonl").exists()
         assert (Path(cfg.storage.processed_dir) / "dataset_stats.json").exists()
 
-    def test_stats_json_is_valid(self, cfg):
+    def test_stats_json_is_valid(self, cfg: Config):
         pair = make_pair()
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
         write_chunk(chunk, [pair])
@@ -213,7 +213,7 @@ class TestOutputFiles:
         assert "dropped_total" in stats
         assert "clean_total" in stats
 
-    def test_output_records_are_valid_json(self, cfg):
+    def test_output_records_are_valid_json(self, cfg: Config):
         pairs = [make_pair(repo=f"org/r{i}", buggy="x " * 30, fixed="y " * 30)
                  for i in range(5)]
         chunk = Path(cfg.storage.extracted_dir) / "extracted_0000.jsonl"
