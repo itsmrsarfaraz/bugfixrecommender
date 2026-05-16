@@ -30,14 +30,7 @@ def make_mock_result(rank=1, score=42.5, repo="apache/kafka"):
 
 @pytest.fixture
 def client():
-    """
-    TestClient with a mocked BM25 engine.
-    We patch the global _engine in api.server so the index
-    never needs to exist on disk for tests to pass.
-    """
-    # Import here so the module-level lifespan doesn't fire
     import api.server as server_module
-
     mock_engine = MagicMock()
     mock_engine.is_ready.return_value = True
     mock_engine.stats.return_value = {
@@ -52,26 +45,18 @@ def client():
         make_mock_result(rank=1, score=51.7, repo="apache/kafka"),
         make_mock_result(rank=2, score=45.3, repo="netty/netty"),
     ]
-
-    # Inject the mock engine directly — bypass lifespan/startup
-    server_module._engine = mock_engine
-
     with TestClient(server_module.app, raise_server_exceptions=True) as c:
+        server_module._engine = mock_engine   # override AFTER lifespan
         yield c
-
-    # Clean up
     server_module._engine = None
 
 
 @pytest.fixture
 def client_no_index():
-    """TestClient simulating a server where index hasn't been built."""
     import api.server as server_module
-    server_module._engine = None
-
     with TestClient(server_module.app, raise_server_exceptions=True) as c:
+        server_module._engine = None                      # now overrides the loaded engine
         yield c
-
     server_module._engine = None
 
 
