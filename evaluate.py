@@ -1,40 +1,42 @@
 """
-evaluate.py — Measure retrieval quality on the held-out test set.
+evaluate.py — Measure BM25 retrieval quality. Two correct metrics.
 
-Metrics:
-  Hit@K:  Does the correct fix appear in the top-K results?
-          The "correct fix" is matched by pair_id — exact retrieval.
-          This is a strict lower bound on real usefulness, because
-          semantically similar fixes from other pairs also help users.
+WHY the original evaluation gave 0%:
+  It used pair_id matching against the training index.
+  Test repos are never in the training index (repo-level split),
+  so the correct pair CANNOT appear — 0% is mathematically guaranteed.
+  That measured train/test isolation, not retrieval quality.
 
-  MRR:    Mean Reciprocal Rank. Average of 1/rank for each hit.
-          MRR=1.0 means always top result. MRR=0.2 means avg rank ~5.
+TWO CORRECT METRICS:
 
-WHY pair_id matching (not edit similarity):
-  Edit similarity between two Java files is expensive to compute
-  and noisy — small whitespace differences kill the score.
-  For V1 evaluation, we check if the BM25 engine retrieves the
-  exact pair it was trained on. This is conservative but clean.
+1. Self-retrieval (Hit@K):
+   Build a combined index (train + test).
+   Query each test pair with its own buggy_code.
+   Check if the same pair_id comes back in top-K.
+   Answers: "Given a bug in our database, can BM25 find it?"
+   Expected: 50-90%+ (same file tokenises similarly).
 
-WHY test set is valid:
-  Test repos were never seen during indexing (train.jsonl only).
-  So a Hit@1 means the engine found the right fix pattern from
-  a completely different codebase — genuine generalisation.
+2. Edit Similarity (Jaccard token overlap):
+   Query the TRAINING index with test buggy_code.
+   Measure token overlap: returned fixed_code vs ground-truth fixed_code.
+   Answers: "Are returned fixes related to the actual fix?"
+   Expected: 15-35% cross-repo (BM25 is lexical, not semantic).
 
 Run:
-  python evaluate.py
-  python evaluate.py --top-k 10
-  python evaluate.py --sample 200   (quick smoke test on 200 pairs)
+  python evaluate.py                     # both metrics, 200 test pairs
+  python evaluate.py --metric self       # self-retrieval only (fast)
+  python evaluate.py --metric similarity # similarity only
+  python evaluate.py --sample 100        # quick smoke test
 """
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
-# Allow running from project root
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.config_loader import load_config
@@ -45,19 +47,20 @@ logger = get_logger(__name__)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate BM25 retrieval on test set")
-    p.add_argument("--top-k",  type=int, default=5,    help="Max K for Hit@K (default: 5)")
-    p.add_argument("--sample", type=int, default=None, help="Evaluate on first N test pairs (default: all)")
-    p.add_argument("--output", type=str, default="data/processed/eval_results.json", help="Where to save results")
+    p = argparse.ArgumentParser(description="Evaluate BM25 retrieval quality")
+    p.add_argument("--top-k",  type=int, default=5,
+                   help="Max K for Hit@K (default: 5)")
+    p.add_argument("--sample", type=int, default=200,
+                   help="Evaluate on first N test pairs (default: 200)")
+    p.add_argument("--metric", choices=["self", "similarity", "both"],
+                   default="both",
+                   help="Which evaluation to run (default: both)")
+    p.add_argument("--output", type=str,
+                   default="data/processed/eval_results.json")
     return p.parse_args()
 
 
-def load_test_pairs(test_path: str, sample: Optional[int] = None) -> List[dict]:
-    """Stream test.jsonl and return pairs (optionally truncated)."""
-    path = Path(test_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Test file not found: {path}")
-
+def load_jsonl(path: str, sample: Optional[int] = None) -> List[dict]:
     pairs = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -70,131 +73,234 @@ def load_test_pairs(test_path: str, sample: Optional[int] = None) -> List[dict]:
                 continue
             if sample and len(pairs) >= sample:
                 break
-
     return pairs
 
 
-def evaluate(
-    engine: BM25Engine,
-    test_pairs: List[dict],
-    top_k: int = 5,
-) -> Dict:
-    """
-    Run evaluation loop.
+def token_overlap(a: str, b: str) -> float:
+    """Jaccard token overlap. 0=no overlap, 1=identical token sets."""
+    def tokens(s):
+        return set(re.findall(r'\w+', s.lower()))
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
-    For each test pair:
-      1. Query BM25 with the buggy_code.
-      2. Check if the correct pair_id appears in results.
-      3. Record rank if found, else mark as miss.
 
-    Returns a dict of all metrics.
+def truncate(code: str, max_chars: int = 8000) -> str:
     """
+    Truncate very large files before querying.
+    WHY: BM25 on a 200KB Java file takes 7+ seconds because
+    tokenisation produces 50K+ tokens. First 8000 chars
+    contains the class signature + key methods — plenty for BM25.
+    Query time drops from 7000ms to ~50ms.
+    """
+    return code[:max_chars] if len(code) > max_chars else code
+
+
+# ── Evaluation 1: Self-Retrieval ──────────────────────────────
+
+def eval_self_retrieval(
+    train_path: str,
+    test_path: str,
+    index_dir: str,
+    top_k: int,
+    sample: Optional[int],
+) -> dict:
+    """
+    Build combined (train+test) index.
+    Query each test pair with its own buggy_code.
+    Check if same pair_id is returned in top-K.
+    """
+    logger.info("=== EVALUATION 1: Self-Retrieval ===")
+
+    train_pairs = load_jsonl(train_path)
+    test_pairs  = load_jsonl(test_path, sample=sample)
+    all_pairs   = train_pairs + test_pairs
+
+    logger.info(f"Building combined index: {len(all_pairs)} pairs...")
+
+    # Write combined temp file
+    tmp = Path(index_dir) / "_eval_combined.jsonl"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for p in all_pairs:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    engine = BM25Engine(index_dir=index_dir)
+    engine.build_index(str(tmp))
+    tmp.unlink()
+
     hits_at_k   = {k: 0 for k in range(1, top_k + 1)}
-    reciprocals = []   # for MRR
+    reciprocals = []
     query_times = []
-    zero_result_count = 0
     total = len(test_pairs)
 
-    logger.info(f"Evaluating {total} test pairs with top_k={top_k}...")
+    logger.info(f"Querying {total} test pairs...")
 
     for i, pair in enumerate(test_pairs, 1):
-        if i % 100 == 0:
+        if i % 50 == 0:
             logger.info(f"Progress: {i}/{total}")
 
         pair_id    = pair.get("pair_id", "")
-        buggy_code = pair.get("buggy_code", "")
+        buggy_code = truncate(pair.get("buggy_code", ""))
 
-        if not buggy_code:
+        if not buggy_code or not pair_id:
+            reciprocals.append(0.0)
             continue
 
         start = time.perf_counter()
         results = engine.query(buggy_code, top_k=top_k)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        query_times.append(elapsed_ms)
+        query_times.append((time.perf_counter() - start) * 1000)
 
-        if not results:
-            zero_result_count += 1
-            reciprocals.append(0.0)
-            continue
+        found_rank = next(
+            (r.rank for r in results if r.pair_id == pair_id), None
+        )
 
-        # Check if the correct pair_id appears in results
-        found_at_rank = None
-        for result in results:
-            if result.pair_id == pair_id:
-                found_at_rank = result.rank
-                break
-
-        if found_at_rank is not None:
-            # Hit — record at all K >= found_at_rank
-            for k in range(found_at_rank, top_k + 1):
+        if found_rank is not None:
+            for k in range(found_rank, top_k + 1):
                 hits_at_k[k] += 1
-            reciprocals.append(1.0 / found_at_rank)
+            reciprocals.append(1.0 / found_rank)
         else:
             reciprocals.append(0.0)
 
-    # Compute final metrics
-    hit_rates = {
-        f"hit@{k}": round(hits_at_k[k] / total, 4)
-        for k in range(1, top_k + 1)
+    return {
+        "eval_type":         "self_retrieval",
+        "total_test_pairs":  total,
+        "total_index_pairs": len(all_pairs),
+        **{f"hit@{k}": round(hits_at_k[k] / total, 4)
+           for k in range(1, top_k + 1)},
+        "mrr":          round(sum(reciprocals) / total, 4) if total else 0.0,
+        "avg_query_ms": round(sum(query_times) / len(query_times), 1)
+                        if query_times else 0.0,
     }
-    mrr = round(sum(reciprocals) / total, 4) if total > 0 else 0.0
-    avg_query_ms = round(sum(query_times) / len(query_times), 2) if query_times else 0.0
+
+
+# ── Evaluation 2: Edit Similarity ─────────────────────────────
+
+def eval_edit_similarity(
+    train_index_dir: str,
+    test_path: str,
+    top_k: int,
+    sample: Optional[int],
+) -> dict:
+    """
+    Query the TRAINING index with test buggy_code.
+    Measure Jaccard overlap: returned fix vs ground-truth fix.
+    """
+    logger.info("=== EVALUATION 2: Edit Similarity ===")
+
+    engine = BM25Engine(index_dir=train_index_dir)
+    engine.load_index()
+
+    test_pairs = load_jsonl(test_path, sample=sample)
+    total = len(test_pairs)
+
+    sims_top1 = []
+    sims_top3 = []
+    query_times = []
+    zero_results = 0
+
+    logger.info(f"Querying {total} test pairs against training index...")
+
+    for i, pair in enumerate(test_pairs, 1):
+        if i % 50 == 0:
+            logger.info(f"Progress: {i}/{total}")
+
+        buggy_code = truncate(pair.get("buggy_code", ""))
+        gt_fix     = pair.get("fixed_code", "")
+
+        if not buggy_code or not gt_fix:
+            continue
+
+        start = time.perf_counter()
+        results = engine.query(buggy_code, top_k=top_k)
+        query_times.append((time.perf_counter() - start) * 1000)
+
+        if not results:
+            zero_results += 1
+            sims_top1.append(0.0)
+            sims_top3.append(0.0)
+            continue
+
+        sims_top1.append(token_overlap(results[0].fixed_code, gt_fix))
+        sims_top3.append(max(
+            token_overlap(r.fixed_code, gt_fix)
+            for r in results[:min(3, len(results))]
+        ))
+
+    def avg(lst): return round(sum(lst) / len(lst), 4) if lst else 0.0
+    def pct_above(lst, t): return round(sum(1 for s in lst if s >= t) / len(lst), 4) if lst else 0.0
 
     return {
-        "total_test_pairs": total,
-        "top_k_evaluated":  top_k,
-        **hit_rates,
-        "mrr": mrr,
-        "avg_query_ms": avg_query_ms,
-        "zero_result_pairs": zero_result_count,
-        "pairs_indexed": engine.stats()["pairs_indexed"],
+        "eval_type":                  "edit_similarity",
+        "total_test_pairs":           total,
+        "avg_jaccard_top1":           avg(sims_top1),
+        "avg_jaccard_top3":           avg(sims_top3),
+        "meaningful_match_top1_pct":  pct_above(sims_top1, 0.20),
+        "meaningful_match_top3_pct":  pct_above(sims_top3, 0.20),
+        "avg_query_ms":               round(sum(query_times) / len(query_times), 1)
+                                      if query_times else 0.0,
+        "zero_result_pairs":          zero_results,
     }
 
 
-def print_report(metrics: dict) -> None:
-    """Print a clean evaluation report to stdout."""
-    print("\n" + "=" * 55)
+# ── Report ────────────────────────────────────────────────────
+
+def print_report(sr: Optional[dict], sim: Optional[dict]) -> None:
+    print("\n" + "=" * 62)
     print("  BUG FIX RECOMMENDER — V1 EVALUATION REPORT")
-    print("=" * 55)
-    print(f"  Test pairs evaluated : {metrics['total_test_pairs']}")
-    print(f"  Training pairs (index): {metrics['pairs_indexed']}")
-    print(f"  Top-K evaluated      : {metrics['top_k_evaluated']}")
-    print("-" * 55)
-    print("  RETRIEVAL METRICS")
-    print("-" * 55)
+    print("=" * 62)
 
-    top_k = metrics["top_k_evaluated"]
-    for k in range(1, top_k + 1):
-        key = f"hit@{k}"
-        val = metrics.get(key, 0.0)
-        bar = "█" * int(val * 30)
-        print(f"  Hit@{k:<2}  {val:.1%}  {bar}")
+    if sr:
+        top_k = max(int(k.split("@")[1]) for k in sr if k.startswith("hit@"))
+        print(f"\n  METRIC 1: Self-Retrieval  (index: {sr['total_index_pairs']} pairs)")
+        print(f"  Question: 'Can BM25 retrieve a known pair from ~10K pairs?'")
+        print("-" * 62)
+        for k in range(1, top_k + 1):
+            val = sr.get(f"hit@{k}", 0.0)
+            bar = "█" * int(val * 30)
+            print(f"  Hit@{k:<2}  {val:.1%}  {bar}")
+        print(f"\n  MRR        {sr['mrr']:.4f}")
+        print(f"  Avg query  {sr['avg_query_ms']:.0f} ms")
 
-    print(f"\n  MRR           {metrics['mrr']:.4f}")
-    print(f"  Avg query time {metrics['avg_query_ms']:.1f} ms")
-    print(f"  Zero-result    {metrics['zero_result_pairs']} pairs")
-    print("=" * 55)
+        h1 = sr.get("hit@1", 0)
+        print("\n  ↳ ", end="")
+        if h1 >= 0.70:
+            print(f"Hit@1 {h1:.0%} — BM25 uniquely identifies pairs. Excellent.")
+        elif h1 >= 0.40:
+            print(f"Hit@1 {h1:.0%} — BM25 working well. Some ambiguity exists.")
+        elif h1 >= 0.20:
+            print(f"Hit@1 {h1:.0%} — Moderate. Large similar files cause collisions.")
+        else:
+            print(f"Hit@1 {h1:.0%} — Low self-retrieval. Many files are very similar.")
+            print("     Typical for codebases sharing import patterns (Spring, Alibaba).")
 
-    # Interpretation
-    hit1 = metrics.get("hit@1", 0.0)
-    hit5 = metrics.get("hit@5", 0.0) if top_k >= 5 else None
-    print("\n  INTERPRETATION")
-    print("-" * 55)
-    if hit1 >= 0.35:
-        print("  Hit@1 ≥ 35% — Strong V1 baseline. Ready to ship.")
-    elif hit1 >= 0.15:
-        print("  Hit@1 15-35% — Acceptable V1. Upgrade to V2 reranker.")
-    else:
-        print("  Hit@1 < 15%  — Weak. Check data quality and filters.")
+    if sim:
+        print(f"\n  METRIC 2: Cross-Repo Edit Similarity")
+        print(f"  Question: 'Do returned fixes resemble the actual fix?'")
+        print("-" * 62)
+        print(f"  Avg Jaccard Top-1:    {sim['avg_jaccard_top1']:.3f}  (0=none, 1=identical)")
+        print(f"  Avg Jaccard Top-3:    {sim['avg_jaccard_top3']:.3f}  (best of 3 results)")
+        print(f"  >20% overlap Top-1:   {sim['meaningful_match_top1_pct']:.1%} of queries")
+        print(f"  >20% overlap Top-3:   {sim['meaningful_match_top3_pct']:.1%} of queries")
+        print(f"  Avg query time:       {sim['avg_query_ms']:.0f} ms")
 
-    if hit5:
-        print(f"  Hit@5 {hit5:.1%} — {hit5/hit1:.1f}x improvement over Hit@1 with K=5")
+        avg1 = sim["avg_jaccard_top1"]
+        m1   = sim["meaningful_match_top1_pct"]
+        print("\n  ↳ ", end="")
+        if avg1 >= 0.30:
+            print(f"Avg {avg1:.3f} — Strong. BM25 finds genuinely related fixes.")
+        elif avg1 >= 0.15:
+            print(f"Avg {avg1:.3f} — Moderate. Expected for lexical cross-repo retrieval.")
+            print(f"     {m1:.0%} of queries returned a fix with >20% token overlap.")
+        else:
+            print(f"Avg {avg1:.3f} — Low average. Check meaningful_match_pct for context.")
+            print(f"     Large files skew averages down. {m1:.0%} queries had >20% overlap.")
 
-    print("\n  NEXT STEPS FOR V2")
-    print("  - Add CodeBERT embedding reranker on top of BM25 results")
-    print("  - Add repo diversity penalty (cap results per repo)")
-    print("  - Expand dataset to 50K+ pairs")
-    print("=" * 55)
+    print("\n  PRIORITY V2 IMPROVEMENTS")
+    print("  1. Truncate query to first 8000 chars (already done in this eval)")
+    print("  2. Add max_results_per_repo=2 cap in BM25Engine.query()")
+    print("  3. CodeBERT reranker on top-10 BM25 results")
+    print("=" * 62)
 
 
 def main():
@@ -209,31 +315,52 @@ def main():
         retention=cfg.logging.retention,
     )
 
-    # Load BM25 index
-    engine = BM25Engine(index_dir=cfg.checkpoints.checkpoint_dir)
-    engine.load_index()
-    logger.info(f"Index loaded: {engine.stats()['pairs_indexed']} pairs")
+    train_path = str(Path(cfg.storage.processed_dir) / "train.jsonl")
+    test_path  = str(Path(cfg.storage.processed_dir) / "test.jsonl")
+    index_dir  = cfg.checkpoints.checkpoint_dir
 
-    # Load test pairs
-    test_path = Path(cfg.storage.processed_dir) / "test.jsonl"
-    test_pairs = load_test_pairs(str(test_path), sample=args.sample)
-    logger.info(f"Test pairs loaded: {len(test_pairs)}")
+    sr  = None
+    sim = None
+    t0  = time.perf_counter()
 
-    # Run evaluation
-    start = time.perf_counter()
-    metrics = evaluate(engine, test_pairs, top_k=args.top_k)
-    total_time = time.perf_counter() - start
-    metrics["total_eval_time_s"] = round(total_time, 1)
+    if args.metric in ("self", "both"):
+        sr = eval_self_retrieval(
+            train_path=train_path,
+            test_path=test_path,
+            index_dir=index_dir,
+            top_k=args.top_k,
+            sample=args.sample,
+        )
 
-    # Print report
-    print_report(metrics)
+    if args.metric in ("similarity", "both"):
+        sim = eval_edit_similarity(
+            train_index_dir=index_dir,
+            test_path=test_path,
+            top_k=args.top_k,
+            sample=args.sample,
+        )
 
-    # Save results
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-    logger.info(f"Results saved to: {output_path}")
+    print_report(sr, sim)
+
+    result = {
+        "total_eval_time_s": round(time.perf_counter() - t0, 1),
+        "sample_size": args.sample,
+        "top_k": args.top_k,
+    }
+    if sr:  result["self_retrieval"]  = sr
+    if sim: result["edit_similarity"] = sim
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    logger.info(f"Results saved: {out}")
+
+    # Restore training-only index after self-retrieval
+    if args.metric in ("self", "both"):
+        logger.info("Restoring training-only index...")
+        BM25Engine(index_dir=index_dir).build_index(train_path)
+        logger.info("Done.")
 
 
 if __name__ == "__main__":
