@@ -25,12 +25,12 @@
         "commands": [
             {
                 "command": "bugfix.recommend",
-                "title": "Bug Fix: Get Recommendations",
+                "title": "Bug Fix: Get Recommendations for Selection",
                 "category": "Bug Fix Recommender"
             },
             {
                 "command": "bugfix.recommendFile",
-                "title": "Bug Fix: Recommend for Entire File",
+                "title": "Bug Fix: Get Recommendations for Entire File",
                 "category": "Bug Fix Recommender"
             }
         ],
@@ -38,16 +38,21 @@
             "editor/context": [
                 {
                     "command": "bugfix.recommend",
-                    "when": "editorHasSelection && resourceLangId == java",
+                    "when": "editorFocus && resourceLangId == java",
                     "group": "bugfix@1"
+                },
+                {
+                    "command": "bugfix.recommendFile",
+                    "when": "editorFocus && resourceLangId == java",
+                    "group": "bugfix@2"
                 }
             ]
         },
         "keybindings": [
             {
                 "command": "bugfix.recommend",
-                "key": "ctrl+shift+b",
-                "mac": "cmd+shift+b",
+                "key": "ctrl+alt+b",
+                "mac": "cmd+alt+b",
                 "when": "editorFocus && resourceLangId == java"
             }
         ],
