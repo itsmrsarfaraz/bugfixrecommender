@@ -4,6 +4,11 @@
     "description": "Recommends Java bug fixes based on 11,000+ real GitHub commits using BM25 retrieval.",
     "version": "0.1.0",
     "publisher": "itsmrsarfaraz",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/itsmrsarfaraz/bugfixrecommender.git"
+    },
+    "license": "MIT",
     "engines": {
         "vscode": "^1.85.0"
     },
@@ -15,7 +20,8 @@
         "java",
         "bug fix",
         "AI",
-        "recommendation"
+        "recommendation",
+        "BM25"
     ],
     "activationEvents": [
         "onLanguage:java"
@@ -78,11 +84,12 @@
         "vscode:prepublish": "npm run compile",
         "compile": "tsc -p ./",
         "watch": "tsc -watch -p ./",
-        "lint": "eslint src"
+        "package": "vsce package"
     },
     "devDependencies": {
         "@types/node": "^20.0.0",
         "@types/vscode": "^1.85.0",
+        "@vscode/vsce": "^3.0.0",
         "typescript": "^5.3.0"
     }
 }
