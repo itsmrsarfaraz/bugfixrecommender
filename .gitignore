@@ -20,6 +20,7 @@ data/raw/
 data/extracted/
 data/processed/
 checkpoints/
+**/node_modules/
 
 # Logs
 logs/

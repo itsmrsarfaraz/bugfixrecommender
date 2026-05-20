@@ -1,0 +1,83 @@
+{
+    "name": "bugfix-recommender",
+    "displayName": "Bug Fix Recommender",
+    "description": "Recommends Java bug fixes based on 11,000+ real GitHub commits using BM25 retrieval.",
+    "version": "0.1.0",
+    "publisher": "itsmrsarfaraz",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other",
+        "Programming Languages"
+    ],
+    "keywords": [
+        "java",
+        "bug fix",
+        "AI",
+        "recommendation"
+    ],
+    "activationEvents": [
+        "onLanguage:java"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "bugfix.recommend",
+                "title": "Bug Fix: Get Recommendations",
+                "category": "Bug Fix Recommender"
+            },
+            {
+                "command": "bugfix.recommendFile",
+                "title": "Bug Fix: Recommend for Entire File",
+                "category": "Bug Fix Recommender"
+            }
+        ],
+        "menus": {
+            "editor/context": [
+                {
+                    "command": "bugfix.recommend",
+                    "when": "editorHasSelection && resourceLangId == java",
+                    "group": "bugfix@1"
+                }
+            ]
+        },
+        "keybindings": [
+            {
+                "command": "bugfix.recommend",
+                "key": "ctrl+shift+b",
+                "mac": "cmd+shift+b",
+                "when": "editorFocus && resourceLangId == java"
+            }
+        ],
+        "configuration": {
+            "title": "Bug Fix Recommender",
+            "properties": {
+                "bugfixRecommender.serverUrl": {
+                    "type": "string",
+                    "default": "http://127.0.0.1:8000",
+                    "description": "URL of the Bug Fix Recommender API server."
+                },
+                "bugfixRecommender.topK": {
+                    "type": "number",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Number of fix recommendations to return."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "lint": "eslint src"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "typescript": "^5.3.0"
+    }
+}
