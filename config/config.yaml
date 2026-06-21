@@ -52,7 +52,7 @@ downloader:
 
   # Skip repos larger than this (MB). Shallow clone still helps,
   # but repos like intellij-community (2GB) are impractical.
-  max_repo_size_mb: 500
+  max_repo_size_mb: 300
 
 extractor:
   # Keywords that flag a commit as a bug fix.
