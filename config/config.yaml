@@ -20,7 +20,7 @@ github:
 
   # Max repos to discover per pipeline run.
   # Keeps run time predictable on your hardware.
-  max_repos: 200
+  max_repos: 500
 
   # GitHub API search query (v1 = Java only)
   language: "Java"
