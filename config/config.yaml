@@ -12,7 +12,7 @@ github:
 
   # Only clone repos with at least this many stars.
   # Low-star repos = abandoned code = noisy data.
-  min_stars: 100
+  min_stars: 50
 
   # Only consider repos updated within this many days.
   # Dead repos produce stale, irrelevant bug patterns.
@@ -20,7 +20,7 @@ github:
 
   # Max repos to discover per pipeline run.
   # Keeps run time predictable on your hardware.
-  max_repos: 500
+  max_repos: 5000
 
   # GitHub API search query (v1 = Java only)
   language: "Java"
@@ -41,7 +41,7 @@ downloader:
 
   # How many repos to clone per pipeline run.
   # Small batches = safe checkpointing on your 40GB SSD.
-  batch_size: 20
+  batch_size: 50
 
   # Seconds git clone will wait before failing.
   clone_timeout_seconds: 300

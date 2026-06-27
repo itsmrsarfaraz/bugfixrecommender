@@ -1,25 +1,16 @@
 """
 repo_discovery.py — Discover Java repositories from GitHub.
 
-WHY this is a separate module from downloader:
-- Discovery is read-only and fast (API calls only).
-- Downloader is destructive (writes to disk, takes hours).
-- Separating them lets you re-run either independently.
-- Clean single responsibility.
+V2 change from V1:
+- GitHub search API hard-caps results at 1,000 per query.
+  One query (stars:>=50) hits this wall immediately.
+- Fix: run multiple queries over non-overlapping star bands.
+  Each band yields up to 1,000 results → 6 bands = ~6,000 repos.
+- Everything else (checkpointing, filtering, rate limits) unchanged.
 
-OUTPUT:
-    checkpoints/discovered_repos.json
-    [
-      {
-        "full_name": "apache/commons-lang",
-        "clone_url": "https://github.com/apache/commons-lang.git",
-        "stars": 2400,
-        "language": "Java",
-        "last_push": "2024-03-01T12:00:00Z",
-        "default_branch": "master"
-      },
-      ...
-    ]
+Star bands chosen so each returns close to 1,000 repos:
+  50–100   | 101–250  | 251–500
+  501–1000 | 1001–5000 | >5000
 """
 
 import json
@@ -35,45 +26,48 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Star bands — each maps to one GitHub search query.
+# GitHub returns max 1,000 results per query sorted by stars desc.
+# Non-overlapping bands prevent duplicate repos across queries.
+_STAR_BANDS = [
+    (50,   100),
+    (101,  250),
+    (251,  500),
+    (501,  1000),
+    (1001, 5000),
+    (5001, None),   # None = no upper bound (stars:>5000)
+]
+
 
 class RepoDiscovery:
     """
     Discovers GitHub repositories matching our quality filters.
 
-    Attributes:
-        cfg:              Validated pipeline config.
-        checkpoint_path:  Path to discovered_repos.json.
-        discovered:       Dict[full_name → repo_metadata] for O(1) dedup.
+    V2: runs one search query per star band to work around
+    GitHub's 1,000-result-per-query hard cap.
     """
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.checkpoint_path = Path(cfg.checkpoints.checkpoint_dir) / cfg.checkpoints.discovered_repos_file
-
-        # Load any repos already discovered in a previous run.
-        # This is what makes discovery resumable.
+        self.checkpoint_path = (
+            Path(cfg.checkpoints.checkpoint_dir)
+            / cfg.checkpoints.discovered_repos_file
+        )
         self.discovered: Dict[str, dict] = self._load_checkpoint()
 
-        # Build PyGithub client.
-        # Authenticated = 5000 req/hr. Unauthenticated = 60 req/hr.
         token = cfg.github.token
         if token:
             self._gh = Github(token)
             logger.info("GitHub client: authenticated (5000 req/hr)")
         else:
             self._gh = Github()
-            logger.warning("GitHub client: unauthenticated (60 req/hr) — set GITHUB_TOKEN")
+            logger.warning(
+                "GitHub client: unauthenticated (60 req/hr) — set GITHUB_TOKEN"
+            )
 
     # ── Public API ────────────────────────────────────────────
 
     def run(self) -> List[dict]:
-        """
-        Run discovery until we have cfg.github.max_repos repos
-        or we exhaust GitHub search results.
-
-        Returns:
-            List of repo metadata dicts.
-        """
         target = self.cfg.github.max_repos
         already_have = len(self.discovered)
 
@@ -86,12 +80,35 @@ class RepoDiscovery:
 
         logger.info(
             f"Starting discovery. Have {already_have}/{target} repos. "
-            f"Need {target - already_have} more."
+            f"Need {target - already_have} more. "
+            f"Running {len(_STAR_BANDS)} star-band queries."
         )
 
-        query = self._build_search_query()
-        logger.info(f"GitHub search query: '{query}'")
+        for lo, hi in _STAR_BANDS:
+            if len(self.discovered) >= target:
+                logger.info(f"Reached target of {target} repos. Stopping.")
+                break
 
+            query = self._build_band_query(lo, hi)
+            logger.info(
+                f"Band query: '{query}' | "
+                f"Discovered so far: {len(self.discovered)}/{target}"
+            )
+            self._run_one_band(query, target)
+
+        final_count = len(self.discovered)
+        logger.info(f"Discovery complete. Total repos: {final_count}")
+        return list(self.discovered.values())
+
+    # ── Per-band search ───────────────────────────────────────
+
+    def _run_one_band(self, query: str, target: int) -> None:
+        """
+        Run one GitHub search query and collect repos until:
+        - we hit the per-query 1,000-result cap, OR
+        - we reach the global target, OR
+        - results are exhausted.
+        """
         try:
             repos = self._gh.search_repositories(
                 query=query,
@@ -99,183 +116,127 @@ class RepoDiscovery:
                 order="desc",
             )
         except GithubException as e:
-            logger.error(f"GitHub search failed: {e}")
-            return list(self.discovered.values())
+            logger.error(f"GitHub search failed for '{query}': {e}")
+            return
 
-        page_num = 0
+        band_added = 0
+
         for repo in repos:
-            # Stop if we have enough repos
             if len(self.discovered) >= target:
-                logger.info(f"Reached target of {target} repos. Stopping.")
                 break
 
-            # Rate limit — check and sleep if needed
             self._handle_rate_limit()
 
-            # Skip if already discovered (dedup across runs)
             if repo.full_name in self.discovered:
                 logger.debug(f"Skip (already discovered): {repo.full_name}")
                 continue
 
-            # Apply quality filters
             reason = self._filter_reason(repo)
             if reason:
                 logger.debug(f"Skip ({reason}): {repo.full_name}")
                 continue
 
-            # Repo passes — record it
             entry = self._extract_metadata(repo)
             self.discovered[repo.full_name] = entry
+            band_added += 1
             logger.info(
                 f"[{len(self.discovered)}/{target}] Discovered: "
                 f"{repo.full_name} ★{repo.stargazers_count}"
             )
-
-            # Checkpoint after every accepted repo so we never
-            # lose progress to a rate limit or crash
             self._save_checkpoint()
-
-            # Polite delay — avoid secondary rate limits
             time.sleep(self.cfg.github.request_delay_seconds)
 
-            # Log page progress every 20 repos
-            page_num += 1
-            if page_num % 20 == 0:
-                self._log_rate_limit_status()
+        logger.info(
+            f"Band '{query}' complete. Added {band_added} repos. "
+            f"Total: {len(self.discovered)}"
+        )
 
-        final_count = len(self.discovered)
-        logger.info(f"Discovery complete. Total repos: {final_count}")
-        return list(self.discovered.values())
+    # ── Query builder ─────────────────────────────────────────
 
-    # ── Private helpers ───────────────────────────────────────
-
-    def _build_search_query(self) -> str:
+    def _build_band_query(self, lo: int, hi: Optional[int]) -> str:
         """
-        Build the GitHub search query string.
+        Build a star-range GitHub search query.
 
-        We use stars threshold in the query itself so GitHub
-        pre-filters before we even paginate — saves API calls.
+        Examples:
+          lo=50,  hi=100  → 'language:Java stars:50..100'
+          lo=5001, hi=None → 'language:Java stars:>5000'
         """
         lang = self.cfg.github.language
-        stars = self.cfg.github.min_stars
-        return f"language:{lang} stars:>={stars}"
+        if hi is None:
+            return f"language:{lang} stars:>{lo - 1}"
+        return f"language:{lang} stars:{lo}..{hi}"
+
+    # ── Filtering ─────────────────────────────────────────────
 
     def _filter_reason(self, repo) -> Optional[str]:
-        """
-        Return a rejection reason string if repo should be skipped,
-        or None if the repo passes all filters.
-
-        WHY per-filter reason strings:
-        - Readable debug logs tell you exactly why a repo was skipped.
-        - Easy to tune thresholds based on actual skip reasons.
-        """
-        # Stars check (redundant with query but explicit for logging)
         if repo.stargazers_count < self.cfg.github.min_stars:
             return f"stars too low ({repo.stargazers_count})"
 
-        # Activity check — skip repos with no pushes recently
         if repo.pushed_at is None:
             return "no push date"
 
         cutoff = datetime.now(timezone.utc) - timedelta(
             days=self.cfg.github.min_activity_days
         )
-        # pushed_at may be naive or aware depending on PyGithub version
         pushed = repo.pushed_at
         if pushed.tzinfo is None:
             pushed = pushed.replace(tzinfo=timezone.utc)
-
         if pushed < cutoff:
             return f"inactive (last push: {pushed.date()})"
 
-        # Skip forks — we want original codebases.
-        # Forks produce duplicate code pairs which inflates
-        # dataset size without adding new patterns.
         if repo.fork:
             return "is a fork"
 
-        # Skip archived repos — no longer maintained
         if repo.archived:
             return "archived"
 
-        return None  # passes all filters
+        return None
+
+    # ── Metadata extraction ───────────────────────────────────
 
     def _extract_metadata(self, repo) -> dict:
-        """
-        Extract only the fields we need from the PyGithub repo object.
-
-        WHY minimal metadata:
-        - PyGithub objects hold 50+ fields. We don't need most of them.
-        - Storing only what we use keeps checkpoint files small and clear.
-        """
         pushed = repo.pushed_at
         if pushed is not None and pushed.tzinfo is None:
             pushed = pushed.replace(tzinfo=timezone.utc)
-
         return {
-            "full_name": repo.full_name,
-            "clone_url": repo.clone_url,
-            "stars": repo.stargazers_count,
-            "language": repo.language,
-            "last_push": pushed.isoformat() if pushed else None,
+            "full_name":      repo.full_name,
+            "clone_url":      repo.clone_url,
+            "stars":          repo.stargazers_count,
+            "language":       repo.language,
+            "last_push":      pushed.isoformat() if pushed else None,
             "default_branch": repo.default_branch,
-            "description": (repo.description or "")[:200],  # truncate
+            "description":    (repo.description or "")[:200],
         }
 
-    def _handle_rate_limit(self) -> None:
-        """
-        Check remaining API calls. If below safety threshold,
-        sleep until the rate limit window resets.
+    # ── Rate limit handling ───────────────────────────────────
 
-        WHY 50-call safety buffer (not 0):
-        - Other PyGithub calls (repo metadata fetch) also consume quota.
-        - Cutting it to zero causes unexpected 403s mid-loop.
-        """
+    def _handle_rate_limit(self) -> None:
         try:
             rate = self._gh.get_rate_limit().search
-            remaining = rate.remaining
-
-            if remaining < 5:
-                reset_time = rate.reset  # datetime (UTC)
+            if rate.remaining < 5:
+                reset_time = rate.reset
                 now = datetime.now(timezone.utc)
                 sleep_seconds = max((reset_time - now).total_seconds() + 5, 10)
                 logger.warning(
-                    f"Rate limit low ({remaining} remaining). "
-                    f"Sleeping {sleep_seconds:.0f}s until reset at {reset_time.strftime('%H:%M:%S')} UTC"
+                    f"Rate limit low ({rate.remaining} remaining). "
+                    f"Sleeping {sleep_seconds:.0f}s until "
+                    f"{reset_time.strftime('%H:%M:%S')} UTC"
                 )
                 time.sleep(sleep_seconds)
-                logger.info("Rate limit reset. Resuming discovery.")
-
+                logger.info("Rate limit reset. Resuming.")
         except Exception as e:
-            # Don't crash the pipeline if rate limit check itself fails
-            logger.warning(f"Could not check rate limit: {e}. Sleeping 10s as precaution.")
+            logger.warning(f"Rate limit check failed: {e}. Sleeping 10s.")
             time.sleep(10)
 
-    def _log_rate_limit_status(self) -> None:
-        """Log current rate limit status for operational visibility."""
-        try:
-            core = self._gh.get_rate_limit().core
-            search = self._gh.get_rate_limit().search
-            logger.info(
-                f"Rate limit — core: {core.remaining}/{core.limit} | "
-                f"search: {search.remaining}/{search.limit}"
-            )
-        except Exception:
-            pass  # Non-critical — don't interrupt pipeline
+    # ── Checkpoint helpers ────────────────────────────────────
 
     def _load_checkpoint(self) -> Dict[str, dict]:
-        """
-        Load previously discovered repos from checkpoint file.
-        Returns empty dict if checkpoint doesn't exist yet.
-        """
         if not self.checkpoint_path.exists():
             logger.debug("No discovery checkpoint found. Starting fresh.")
             return {}
-
         try:
             with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # data is a list → convert to dict keyed by full_name for O(1) dedup
             discovered = {r["full_name"]: r for r in data}
             logger.info(
                 f"Loaded checkpoint: {len(discovered)} repos already discovered."
@@ -286,23 +247,16 @@ class RepoDiscovery:
             return {}
 
     def _save_checkpoint(self) -> None:
-        """
-        Write current discovered repos to checkpoint file (atomic write).
-
-        WHY atomic write (write to .tmp then rename):
-        - If the process crashes mid-write, the checkpoint file
-          stays valid. A direct write could produce a half-written
-          JSON file that fails to parse on the next run.
-        """
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.checkpoint_path.with_suffix(".tmp")
-
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(list(self.discovered.values()), f, indent=2, default=str)
-            # Atomic rename — replaces checkpoint only if write succeeded
+                json.dump(
+                    list(self.discovered.values()), f,
+                    indent=2, default=str
+                )
             tmp_path.replace(self.checkpoint_path)
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
             if tmp_path.exists():
-                tmp_path.unlink()  # Clean up partial file
+                tmp_path.unlink()
