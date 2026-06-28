@@ -97,7 +97,7 @@ class ResultsPanel {
             const pct = maxScore > 0 ? Math.round((r.score / maxScore) * 100) : 0;
             const repoUrl = `https://github.com/${r.repo}`;
             // Escape HTML to prevent XSS from code content
-            const fixedEscaped = escapeHtml(r.fixed_code);
+            const fixedEscaped = escapeHtml(extractDiff(r.buggy_code, r.fixed_code));
             const commitEscaped = escapeHtml(r.commit_message);
             const fileEscaped = escapeHtml(r.file_path);
             return `
@@ -354,5 +354,28 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
+}
+function extractDiff(buggy, fixed) {
+    const buggyLines = buggy.split('\n');
+    const fixedLines = fixed.split('\n');
+    const removed = [];
+    const added = [];
+    // Find lines that changed
+    const buggySet = new Set(buggyLines.map(l => l.trim()));
+    const fixedSet = new Set(fixedLines.map(l => l.trim()));
+    for (const line of buggyLines) {
+        if (!fixedSet.has(line.trim()) && line.trim()) {
+            removed.push('- ' + line);
+        }
+    }
+    for (const line of fixedLines) {
+        if (!buggySet.has(line.trim()) && line.trim()) {
+            added.push('+ ' + line);
+        }
+    }
+    if (removed.length === 0 && added.length === 0) {
+        return fixed.slice(0, 300);
+    }
+    return [...removed, ...added].slice(0, 30).join('\n');
 }
 //# sourceMappingURL=resultsPanel.js.map
