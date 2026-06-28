@@ -123,7 +123,7 @@ def main() -> None:
         from src.retrieval.bm25_engine import BM25Engine
         train_path = Path(cfg.storage.processed_dir) / "train.jsonl"
         engine = BM25Engine(index_dir=cfg.checkpoints.checkpoint_dir)
-        engine.build_index(str(train_path))
+        engine.build_index(str(train_path), max_pairs=30000)
         s = engine.stats()
         logger.info(f"Index ready: {s['pairs_indexed']} pairs | {s['index_size_mb']} MB | k1={s['k1']} b={s['b']}")
 

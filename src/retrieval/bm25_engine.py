@@ -108,7 +108,7 @@ class BM25Engine:
 
     # ── Public API ────────────────────────────────────────────
 
-    def build_index(self, train_jsonl: str) -> None:
+    def build_index(self, train_jsonl: str, max_pairs: Optional[int] = None) -> None:  
         """
         Tokenize all buggy_code entries in train.jsonl and build the index.
         Saves the index to disk when done.
@@ -143,6 +143,9 @@ class BM25Engine:
                 buggy_code = record.get("buggy_code", "")
                 if not buggy_code:
                     continue
+
+                if max_pairs and len(self._pairs) >= max_pairs:
+                    break
 
                 tokens = self._tokenize(buggy_code)
                 if not tokens:
