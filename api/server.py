@@ -220,7 +220,9 @@ async def generate_fix(request: GenerateFixRequest):
             outputs = _codet5_model.generate(
                 **inputs,
                 max_new_tokens=MAX_OUT,
-                num_beams=4,
+                num_beams=5,
+                temperature=0.3,
+                no_repeat_ngram_size=2,
                 early_stopping=True,
             )
 
