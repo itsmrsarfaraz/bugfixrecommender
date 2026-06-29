@@ -36,5 +36,4 @@ logs/
 Thumbs.db
 
 # Secrets — GitHub tokens must NEVER be committed
-config/secrets.yamlmodels/codet5_bugfix/final_production_model/model.safetensors
 models/
